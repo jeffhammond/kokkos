@@ -45,167 +45,145 @@
 #define KOKKOS_TBB_HPP
 
 #include <Kokkos_Macros.hpp>
-#if defined( KOKKOS_ENABLE_TBB)
+#if defined( KOKKOS_ENABLE_TBB )
 
 #include <Kokkos_Core_fwd.hpp>
 
 #include <cstddef>
 #include <iosfwd>
 #include <Kokkos_HostSpace.hpp>
-
-#ifdef KOKKOS_ENABLE_HBWSPACE
-#include <Kokkos_HBWSpace.hpp>
-#endif
-
 #include <Kokkos_ScratchSpace.hpp>
-#include <Kokkos_Parallel.hpp>
-#include <Kokkos_TaskScheduler.hpp>
 #include <Kokkos_Layout.hpp>
+#include <Kokkos_MemoryTraits.hpp>
 #include <impl/Kokkos_Tags.hpp>
 
-#include <vector>
+#include <tbb/tbb.h>
 
 /*--------------------------------------------------------------------------*/
 
 namespace Kokkos {
 
 namespace Impl {
-class TBBExec;
+class TBBExec ;
 }
 
-/// \class TBB
-/// \brief Kokkos device for multicore processors in the host memory space.
+/** \brief  Execution space for TBB on a CPU. */
 class TBB {
 public:
+  //! \name Type declarations that all Kokkos devices must provide.
+  //@{
   //! Tag this class as a kokkos execution space
-  using execution_space = TBB;
-
-  using memory_space =
-  #ifdef KOKKOS_ENABLE_HBWSPACE
-    Experimental::HBWSpace;
-  #else
-    HostSpace;
-  #endif
+  typedef TBB                      execution_space ;
+  typedef Kokkos::HostSpace        memory_space ;
 
   //! This execution space preferred device_type
-  using device_type          = Kokkos::Device< execution_space, memory_space >;
-  using array_layout         = LayoutRight;
-  using size_type            = memory_space::size_type;
-  using scratch_memory_space = ScratchMemorySpace< TBB >;
+  typedef Kokkos::Device<execution_space,memory_space> device_type;
 
-  /// \brief Get a handle to the default execution space instance
-  inline
-  TBB() noexcept;
+  typedef Kokkos::LayoutRight      array_layout ;
+  typedef memory_space::size_type  size_type ;
 
-  // Using omp_get_max_threads(); is problematic
-  // On Intel (essentially an initial call to the TBB runtime
-  // without a parallel region before will set a process mask for a single core
-  // The runtime will than bind threads for a parallel region to other cores on the
-  // entering the first parallel region and make the process mask the aggregate of
-  // the thread masks. The intend seems to be to make serial code run fast, if you
-  // compile with TBB enabled but don't actually use parallel regions or so
-  // static int omp_max_threads = omp_get_max_threads();
-  static int get_current_max_threads() noexcept;
+  typedef ScratchMemorySpace< TBB >  scratch_memory_space ;
 
-  /// \brief Initialize the default execution space
+
+  //@}
+  /*------------------------------------------------------------------------*/
+  //! \name Static functions that all Kokkos devices must implement.
+  //@{
+
+  /// \brief True if and only if this method is being called in a
+  ///   thread-parallel function.
+  static int in_parallel();
+
+  /** \brief  Set the device in a "sleep" state.
+   *
+   * This function sets the device in a "sleep" state in which it is
+   * not ready for work.  This may consume less resources than if the
+   * device were in an "awake" state, but it may also take time to
+   * bring the device from a sleep state to be ready for work.
+   *
+   * \return True if the device is in the "sleep" state, else false if
+   *   the device is actively working and could not enter the "sleep"
+   *   state.
+   */
+  static bool sleep();
+
+  /// \brief Wake the device from the 'sleep' state so it is ready for work.
   ///
-  /// if ( thread_count == -1 )
-  ///   then use the number of threads that openmp defaults to
-  /// if ( thread_count == 0 && Kokkos::hwlow_available() )
-  ///   then use hwloc to choose the number of threads and change
-  ///   the default number of threads
-  /// if ( thread_count > 0 )
-  ///   then force openmp to use the given number of threads and change
-  ///   the default number of threads
-  static void initialize( int thread_count = -1 );
+  /// \return True if the device is in the "ready" state, else "false"
+  ///  if the device is actively working (which also means that it's
+  ///  awake).
+  static bool wake();
 
-  /// \brief Free any resources being consumed by the default execution space
+  /// \brief Wait until all dispatched functors complete.
+  ///
+  /// The parallel_for or parallel_reduce dispatch of a functor may
+  /// return asynchronously, before the functor completes.  This
+  /// method does not return until all dispatched functors on this
+  /// device have completed.
+  static void fence();
+
+  /// \brief Free any resources being consumed by the device.
+  ///
+  /// For the TBB device, this terminates spawned worker threads.
   static void finalize();
 
-  /// \brief is the default execution space initialized for current 'master' thread
-  static bool is_initialized() noexcept;
-
   /// \brief Print configuration information to the given output stream.
-  static void print_configuration( std::ostream & , const bool verbose = false );
+  static void print_configuration( std::ostream & , const bool detail = false );
 
-  /// \brief is the instance running a parallel algorithm
-  inline
-  static bool in_parallel( TBB const& = TBB() ) noexcept;
+  //@}
+  /*------------------------------------------------------------------------*/
+  /*------------------------------------------------------------------------*/
+  //! \name Space-specific functions
+  //@{
 
-  /// \brief Wait until all dispatched functors complete on the given instance
-  ///
-  ///  This is a no-op on TBB
-  inline
-  static void fence( TBB const& = TBB() ) noexcept;
+  /** \brief Initialize the device in the "ready to work" state.
+   *
+   *  The device is initialized in a "ready to work" or "awake" state.
+   *  This state reduces latency and thus improves performance when
+   *  dispatching work.  However, the "awake" state consumes resources
+   *  even when no work is being done.  You may call sleep() to put
+   *  the device in a "sleeping" state that does not consume as many
+   *  resources, but it will take time (latency) to awaken the device
+   *  again (via the wake()) method so that it is ready for work.
+   *
+   *  Teams of threads are distributed as evenly as possible across
+   *  the requested number of numa regions and cores per numa region.
+   *  A team will not be split across a numa region.
+   *
+   *  If the 'use_' arguments are not supplied the hwloc is queried
+   *  to use all available cores.
+   */
+  static void initialize( unsigned threads_count = 0 ,
+                          unsigned use_numa_count = 0 ,
+                          unsigned use_cores_per_numa = 0 ,
+                          bool allow_asynchronous_threadpool = false );
 
-  /// \brief Does the given instance return immediately after launching
-  /// a parallel algorithm
-  ///
-  /// This always returns false on TBB
-  inline
-  static bool is_asynchronous( TBB const& = TBB() ) noexcept;
+  static int is_initialized();
 
-
-  /// \brief Partition the default instance into new instances without creating
-  ///  new masters
-  ///
-  /// This is a no-op on TBB since the default instance cannot be partitioned
-  /// without promoting other threads to 'master'
-  static std::vector<TBB> partition(...);
-
-  /// Non-default instances should be ref-counted so that when the last
-  /// is destroyed the instance resources are released
-  ///
-  /// This is a no-op on TBB since a non default instance cannot be created
-  static TBB create_instance(...);
-
-  /// \brief Partition the default instance and call 'f' on each new 'master' thread
-  ///
-  /// Func is a functor with the following signiture
-  ///   void( int partition_id, int num_partitions )
-  template <typename F>
-  static void partition_master( F const& f
-                              , int requested_num_partitions = 0
-                              , int requested_partition_size = 0
-                              );
-
-  inline
-  static int thread_pool_size() noexcept;
-
-  /** \brief  The rank of the executing thread in this thread pool */
-  KOKKOS_INLINE_FUNCTION
-  static int thread_pool_rank() noexcept;
-
-#if !defined( KOKKOS_DISABLE_DEPRECATED )
-  /// \brief Initialize the default execution space
-  static void initialize( int thread_count,
-                          int use_numa_count,
-                          int use_cores_per_numa = 0);
-
-  inline
-  static int thread_pool_size( int depth );
-
-  static void sleep() {};
-  static void wake() {};
-
-  // use UniqueToken
+  /** \brief  Return the maximum amount of concurrency.  */
   static int concurrency();
 
-  // use UniqueToken
-  inline
-  static int max_hardware_threads() noexcept;
+  static TBB & instance( int = 0 );
 
-  // use UniqueToken
-  KOKKOS_INLINE_FUNCTION
-  static int hardware_thread_id() noexcept;
+  //----------------------------------------
+
+  static int thread_pool_size( int depth = 0 );
+#if defined( KOKKOS_ACTIVE_EXECUTION_MEMORY_SPACE_HOST )
+  static int thread_pool_rank();
+#else
+  KOKKOS_INLINE_FUNCTION static int thread_pool_rank() { return 0 ; }
 #endif
 
-  static constexpr const char* name() noexcept { return "TBB"; }
+  inline static unsigned max_hardware_threads() { return thread_pool_size(0); }
+  KOKKOS_INLINE_FUNCTION static unsigned hardware_thread_id() { return thread_pool_rank(); }
+
+  static const char* name();
+  //@}
+  //----------------------------------------
 };
 
 } // namespace Kokkos
 
-/*--------------------------------------------------------------------------*/
 /*--------------------------------------------------------------------------*/
 
 namespace Kokkos {
@@ -237,16 +215,18 @@ struct VerifyExecutionCanAccessMemorySpace
 } // namespace Kokkos
 
 /*--------------------------------------------------------------------------*/
-/*--------------------------------------------------------------------------*/
 
+#include <Kokkos_ExecPolicy.hpp>
+#include <Kokkos_Parallel.hpp>
 #include <TBB/Kokkos_TBB_Exec.hpp>
 #include <TBB/Kokkos_TBB_Team.hpp>
 #include <TBB/Kokkos_TBB_Parallel.hpp>
-#include <TBB/Kokkos_TBB_Task.hpp>
 
 #include <KokkosExp_MDRangePolicy.hpp>
-/*--------------------------------------------------------------------------*/
+
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
 
 #endif /* #if defined( KOKKOS_ENABLE_TBB ) */
-#endif /* #ifndef KOKKOS_TBB_HPP */
+#endif /* #define KOKKOS_TBB_HPP */
 

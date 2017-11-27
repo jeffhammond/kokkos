@@ -41,15 +41,15 @@
 //@HEADER
 */
 
+
 #include <Kokkos_Macros.hpp>
 #if defined( KOKKOS_ENABLE_TBB )
 
-#include <cstdio>
-#include <cstdlib>
-
+#include <cstdint>
 #include <limits>
+#include <utility>
 #include <iostream>
-#include <vector>
+#include <sstream>
 
 #include <Kokkos_Core.hpp>
 
@@ -58,310 +58,662 @@
 #include <impl/Kokkos_Profiling_Interface.hpp>
 
 
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
+
+namespace Kokkos {
+namespace Impl {
+namespace {
+
+TBBExec                      s_tbb_process ;
+TBBExec                    * s_tbb_exec[  TBBExec::MAX_THREAD_COUNT ] = { 0 };
+pthread_t                    s_tbb_pid[   TBBExec::MAX_THREAD_COUNT ] = { 0 };
+std::pair<unsigned,unsigned> s_tbb_coord[ TBBExec::MAX_THREAD_COUNT ];
+
+int s_tbb_pool_size[3] = { 0 , 0 , 0 };
+
+unsigned s_current_reduce_size = 0 ;
+unsigned s_current_shared_size = 0 ;
+
+void (* volatile s_current_function)( TBBExec & , const void * );
+const void * volatile s_current_function_arg = 0 ;
+
+struct Sentinel {
+  Sentinel()
+  {}
+
+  ~Sentinel()
+  {
+    if ( s_tbb_pool_size[0] ||
+         s_tbb_pool_size[1] ||
+         s_tbb_pool_size[2] ||
+         s_current_reduce_size ||
+         s_current_shared_size ||
+         s_current_function ||
+         s_current_function_arg ||
+         s_tbb_exec[0] ) {
+      std::cerr << "ERROR : Process exiting without calling Kokkos::TBB::terminate()" << std::endl ;
+    }
+  }
+};
+
+inline
+unsigned fan_size( const unsigned rank , const unsigned size )
+{
+  const unsigned rank_rev = size - ( rank + 1 );
+  unsigned count = 0 ;
+  for ( unsigned n = 1 ; ( rank_rev + n < size ) && ! ( rank_rev & n ) ; n <<= 1 ) { ++count ; }
+  return count ;
+}
+
+} // namespace
+} // namespace Impl
+} // namespace Kokkos
+
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
+
 namespace Kokkos {
 namespace Impl {
 
-int g_openmp_hardware_max_threads = 1;
+void execute_function_noop( TBBExec & , const void * ) {}
 
-__thread int t_openmp_hardware_id = 0;
-__thread Impl::TBBExec * t_openmp_instance = nullptr;
-
-void TBBExec::validate_partition( const int nthreads
-                                   , int & num_partitions
-                                   , int & partition_size
-                                  )
+void TBBExec::driver(void)
 {
-  if (nthreads == 1) {
-    num_partitions = 1;
-    partition_size = 1;
-  }
-  else if( num_partitions < 1 && partition_size < 1) {
-    int idle = nthreads;
-    for (int np = 2; np <= nthreads ; ++np) {
-      for (int ps = 1; ps <= nthreads/np; ++ps) {
-        if (nthreads - np*ps < idle) {
-          idle = nthreads - np*ps;
-          num_partitions = np;
-          partition_size = ps;
-        }
-        if (idle == 0) {
-          break;
-        }
-      }
-    }
-  }
-  else if( num_partitions < 1 && partition_size > 0 ) {
-    if ( partition_size <= nthreads ) {
-      num_partitions = nthreads / partition_size;
-    }
-    else {
-      num_partitions = 1;
-      partition_size = nthreads;
-    }
-  }
-  else if( num_partitions > 0 && partition_size < 1 ) {
-    if ( num_partitions <= nthreads ) {
-      partition_size = nthreads / num_partitions;
-    }
-    else {
-      num_partitions = nthreads;
-      partition_size = 1;
-    }
-  }
-  else if ( num_partitions * partition_size > nthreads ) {
-    int idle = nthreads;
-    const int NP = num_partitions;
-    const int PS = partition_size;
-    for (int np = NP; np > 0; --np) {
-      for (int ps = PS; ps > 0; --ps) {
-        if (  (np*ps <= nthreads)
-           && (nthreads - np*ps < idle) ) {
-          idle = nthreads - np*ps;
-          num_partitions = np;
-          partition_size = ps;
-        }
-        if (idle == 0) {
-          break;
-        }
-      }
-    }
-  }
+  SharedAllocationRecord< void, void >::tracking_enable();
 
+  TBBExec this_thread ;
+
+  while ( TBBExec::Active == this_thread.m_pool_state ) {
+
+    (*s_current_function)( this_thread , s_current_function_arg );
+
+    // Deactivate thread and wait for reactivation
+    this_thread.m_pool_state = TBBExec::Inactive ;
+
+    wait_yield( this_thread.m_pool_state , TBBExec::Inactive );
+  }
 }
 
-void TBBExec::verify_is_master( const char * const label )
+TBBExec::TBBExec()
+  : m_pool_base(0)
+  , m_scratch(0)
+  , m_scratch_reduce_end(0)
+  , m_scratch_tbb_end(0)
+  , m_numa_rank(0)
+  , m_numa_core_rank(0)
+  , m_pool_rank(0)
+  , m_pool_size(0)
+  , m_pool_fan_size(0)
+  , m_pool_state( TBBExec::Terminating )
 {
-  if ( !t_openmp_instance )
-  {
-    std::string msg( label );
-    msg.append( " ERROR: in parallel or not initialized" );
+  if ( & s_tbb_process != this ) {
+
+    // A spawned thread
+
+    TBBExec * const nil = 0 ;
+
+    // Which entry in 's_tbb_exec', possibly determined from hwloc binding
+    const int entry = ((size_t)s_current_function_arg) < size_t(s_tbb_pool_size[0])
+                    ? ((size_t)s_current_function_arg)
+                    : size_t(Kokkos::hwloc::bind_this_thread( s_tbb_pool_size[0] , s_tbb_coord ));
+
+    // Given a good entry set this thread in the 's_tbb_exec' array
+    if ( entry < s_tbb_pool_size[0] &&
+         nil == atomic_compare_exchange( s_tbb_exec + entry , nil , this ) ) {
+
+      const std::pair<unsigned,unsigned> coord = Kokkos::hwloc::get_this_tbb_coordinate();
+
+      m_numa_rank       = coord.first ;
+      m_numa_core_rank  = coord.second ;
+      m_pool_base       = s_tbb_exec ;
+      m_pool_rank       = s_tbb_pool_size[0] - ( entry + 1 );
+      m_pool_rank_rev   = s_tbb_pool_size[0] - ( pool_rank() + 1 );
+      m_pool_size       = s_tbb_pool_size[0] ;
+      m_pool_fan_size   = fan_size( m_pool_rank , m_pool_size );
+      m_pool_state      = TBBExec::Active ;
+
+      s_tbb_pid[ m_pool_rank ] = pthread_self();
+
+      // Inform spawning process that the threads_exec entry has been set.
+      s_tbb_process.m_pool_state = TBBExec::Active ;
+    }
+    else {
+      // Inform spawning process that the threads_exec entry could not be set.
+      s_tbb_process.m_pool_state = TBBExec::Terminating ;
+    }
+  }
+  else {
+    // Enables 'parallel_for' to execute on unitialized Threads device
+    m_pool_rank  = 0 ;
+    m_pool_size  = 1 ;
+    m_pool_state = TBBExec::Inactive ;
+
+    s_tbb_pid[ m_pool_rank ] = pthread_self();
+  }
+}
+
+TBBExec::~TBBExec()
+{
+  const unsigned entry = m_pool_size - ( m_pool_rank + 1 );
+
+  typedef Kokkos::Experimental::Impl::SharedAllocationRecord< Kokkos::HostSpace , void > Record ;
+
+  if ( m_scratch ) {
+    Record * const r = Record::get_record( m_scratch );
+
+    m_scratch = 0 ;
+
+    Record::decrement( r );
+  }
+
+  m_pool_base   = 0 ;
+  m_scratch_reduce_end = 0 ;
+  m_scratch_tbb_end = 0 ;
+  m_numa_rank      = 0 ;
+  m_numa_core_rank = 0 ;
+  m_pool_rank      = 0 ;
+  m_pool_size      = 0 ;
+  m_pool_fan_size  = 0 ;
+
+  m_pool_state  = TBBExec::Terminating ;
+
+  if ( & s_tbb_process != this && entry < MAX_THREAD_COUNT ) {
+    TBBExec * const nil = 0 ;
+
+    atomic_compare_exchange( s_tbb_exec + entry , this , nil );
+
+    s_tbb_process.m_pool_state = TBBExec::Terminating ;
+  }
+}
+
+
+int TBBExec::get_tbb_count()
+{
+  return s_tbb_pool_size[0] ;
+}
+
+TBBExec * TBBExec::get_thread( const int init_tbb_rank )
+{
+  TBBExec * const th =
+    init_tbb_rank < s_tbb_pool_size[0]
+    ? s_tbb_exec[ s_tbb_pool_size[0] - ( init_tbb_rank + 1 ) ] : 0 ;
+
+  if ( 0 == th || th->m_pool_rank != init_tbb_rank ) {
+    std::ostringstream msg ;
+    msg << "Kokkos::Impl::TBBExec::get_thread ERROR : "
+        << "thread " << init_tbb_rank << " of " << s_tbb_pool_size[0] ;
+    if ( 0 == th ) {
+      msg << " does not exist" ;
+    }
+    else {
+      msg << " has wrong thread_rank " << th->m_pool_rank ;
+    }
+    Kokkos::Impl::throw_runtime_exception( msg.str() );
+  }
+
+  return th ;
+}
+
+//----------------------------------------------------------------------------
+
+void TBBExec::execute_sleep( TBBExec & exec , const void * )
+{
+  TBBExec::global_lock();
+  TBBExec::global_unlock();
+
+  const int n = exec.m_pool_fan_size ;
+  const int rank_rev = exec.m_pool_size - ( exec.m_pool_rank + 1 );
+
+  for ( int i = 0 ; i < n ; ++i ) {
+    Impl::spinwait_while_equal<int>( exec.m_pool_base[ rank_rev + (1<<i) ]->m_pool_state , TBBExec::Active );
+  }
+
+  exec.m_pool_state = TBBExec::Inactive ;
+}
+
+}
+}
+
+//----------------------------------------------------------------------------
+
+namespace Kokkos {
+namespace Impl {
+
+void TBBExec::verify_is_process( const std::string & name , const bool initialized )
+{
+  if ( ! is_process() ) {
+    std::string msg( name );
+    msg.append( " FAILED : Called by a worker thread, can only be called by the master process." );
+    Kokkos::Impl::throw_runtime_exception( msg );
+  }
+
+  if ( initialized && 0 == s_tbb_pool_size[0] ) {
+    std::string msg( name );
+    msg.append( " FAILED : TBB not initialized." );
     Kokkos::Impl::throw_runtime_exception( msg );
   }
 }
 
-
-} // namespace Impl
-} // namespace Kokkos
-
-//----------------------------------------------------------------------------
-//----------------------------------------------------------------------------
-
-namespace Kokkos {
-namespace Impl {
-
-void TBBExec::clear_thread_data()
+int TBBExec::in_parallel()
 {
-  const size_t member_bytes =
-    sizeof(int64_t) *
-    HostThreadTeamData::align_to_int64( sizeof(HostThreadTeamData) );
-
-  const int old_alloc_bytes =
-    m_pool[0] ? ( member_bytes + m_pool[0]->scratch_bytes() ) : 0 ;
-
-  TBB::memory_space space ;
-
-  #pragma omp parallel num_threads( m_pool_size )
-  {
-    const int rank = omp_get_thread_num();
-
-    if ( 0 != m_pool[rank] ) {
-
-      m_pool[rank]->disband_pool();
-
-      space.deallocate( m_pool[rank] , old_alloc_bytes );
-
-      m_pool[rank] = 0 ;
-    }
-  }
-/* END #pragma omp parallel */
+  // A thread function is in execution and
+  // the function argument is not the special threads process argument and
+  // the master process is a worker or is not the master process.
+  return s_current_function &&
+         ( & s_tbb_process != s_current_function_arg ) &&
+         ( s_tbb_process.m_pool_base || ! is_process() );
 }
 
-void TBBExec::resize_thread_data( size_t pool_reduce_bytes
-                                   , size_t team_reduce_bytes
-                                   , size_t team_shared_bytes
-                                   , size_t thread_local_bytes )
+// Wait for root thread to become inactive
+void TBBExec::fence()
 {
-  const size_t member_bytes =
-    sizeof(int64_t) *
-    HostThreadTeamData::align_to_int64( sizeof(HostThreadTeamData) );
+  if ( s_tbb_pool_size[0] ) {
+    // Wait for the root thread to complete:
+    Impl::spinwait_while_equal<int>( s_tbb_exec[0]->m_pool_state , TBBExec::Active );
+  }
 
-  HostThreadTeamData * root = m_pool[0] ;
+  s_current_function     = 0 ;
+  s_current_function_arg = 0 ;
 
-  const size_t old_pool_reduce  = root ? root->pool_reduce_bytes() : 0 ;
-  const size_t old_team_reduce  = root ? root->team_reduce_bytes() : 0 ;
-  const size_t old_team_shared  = root ? root->team_shared_bytes() : 0 ;
-  const size_t old_thread_local = root ? root->thread_local_bytes() : 0 ;
-  const size_t old_alloc_bytes  = root ? ( member_bytes + root->scratch_bytes() ) : 0 ;
+  // Make sure function and arguments are cleared before
+  // potentially re-activating threads with a subsequent launch.
+  memory_fence();
+}
 
-  // Allocate if any of the old allocation is tool small:
+/** \brief  Begin execution of the asynchronous functor */
+void TBBExec::start( void (*func)( TBBExec & , const void * ) , const void * arg )
+{
+  verify_is_process("TBBExec::start" , true );
 
-  const bool allocate = ( old_pool_reduce  < pool_reduce_bytes ) ||
-                        ( old_team_reduce  < team_reduce_bytes ) ||
-                        ( old_team_shared  < team_shared_bytes ) ||
-                        ( old_thread_local < thread_local_bytes );
+  if ( s_current_function || s_current_function_arg ) {
+    Kokkos::Impl::throw_runtime_exception( std::string( "TBBExec::start() FAILED : already executing" ) );
+  }
 
-  if ( allocate ) {
+  s_current_function     = func ;
+  s_current_function_arg = arg ;
 
-    if ( pool_reduce_bytes < old_pool_reduce ) { pool_reduce_bytes = old_pool_reduce ; }
-    if ( team_reduce_bytes < old_team_reduce ) { team_reduce_bytes = old_team_reduce ; }
-    if ( team_shared_bytes < old_team_shared ) { team_shared_bytes = old_team_shared ; }
-    if ( thread_local_bytes < old_thread_local ) { thread_local_bytes = old_thread_local ; }
+  // Make sure function and arguments are written before activating threads.
+  memory_fence();
 
-    const size_t alloc_bytes =
-      member_bytes +
-      HostThreadTeamData::scratch_size( pool_reduce_bytes
-                                      , team_reduce_bytes
-                                      , team_shared_bytes
-                                      , thread_local_bytes );
+  // Activate threads:
+  for ( int i = s_tbb_pool_size[0] ; 0 < i-- ; ) {
+    s_tbb_exec[i]->m_pool_state = TBBExec::Active ;
+  }
 
-    TBB::memory_space space ;
+  if ( s_tbb_process.m_pool_size ) {
+    // Master process is the root thread, run it:
+    (*func)( s_tbb_process , arg );
+    s_tbb_process.m_pool_state = TBBExec::Inactive ;
+  }
+}
+
+//----------------------------------------------------------------------------
+
+bool TBBExec::sleep()
+{
+  verify_is_process("TBBExec::sleep", true );
+
+  if ( & execute_sleep == s_current_function ) return false ;
+
+  fence();
+
+  TBBExec::global_lock();
+
+  s_current_function = & execute_sleep ;
+
+  // Activate threads:
+  for ( unsigned i = s_tbb_pool_size[0] ; 0 < i ; ) {
+    s_tbb_exec[--i]->m_pool_state = TBBExec::Active ;
+  }
+
+  return true ;
+}
+
+bool TBBExec::wake()
+{
+  verify_is_process("TBBExec::wake", true );
+
+  if ( & execute_sleep != s_current_function ) return false ;
+
+  TBBExec::global_unlock();
+
+  if ( s_tbb_process.m_pool_base ) {
+    execute_sleep( s_tbb_process , 0 );
+    s_tbb_process.m_pool_state = TBBExec::Inactive ;
+  }
+
+  fence();
+
+  return true ;
+}
+
+//----------------------------------------------------------------------------
+
+void TBBExec::execute_serial( void (*func)( TBBExec & , const void * ) )
+{
+  s_current_function = func ;
+  s_current_function_arg = & s_tbb_process ;
+
+  // Make sure function and arguments are written before activating threads.
+  memory_fence();
+
+  const unsigned begin = s_tbb_process.m_pool_base ? 1 : 0 ;
+
+  for ( unsigned i = s_tbb_pool_size[0] ; begin < i ; ) {
+    TBBExec & th = * s_tbb_exec[ --i ];
+
+    th.m_pool_state = TBBExec::Active ;
+
+    wait_yield( th.m_pool_state , TBBExec::Active );
+  }
+
+  if ( s_tbb_process.m_pool_base ) {
+    s_tbb_process.m_pool_state = TBBExec::Active ;
+    (*func)( s_tbb_process , 0 );
+    s_tbb_process.m_pool_state = TBBExec::Inactive ;
+  }
+
+  s_current_function_arg = 0 ;
+  s_current_function = 0 ;
+
+  // Make sure function and arguments are cleared before proceeding.
+  memory_fence();
+}
+
+//----------------------------------------------------------------------------
+
+void * TBBExec::root_reduce_scratch()
+{
+  return s_tbb_process.reduce_memory();
+}
+
+void TBBExec::execute_resize_scratch( TBBExec & exec , const void * )
+{
+  typedef Kokkos::Experimental::Impl::SharedAllocationRecord< Kokkos::HostSpace , void > Record ;
+
+  if ( exec.m_scratch ) {
+    Record * const r = Record::get_record( exec.m_scratch );
+
+    exec.m_scratch = 0 ;
+
+    Record::decrement( r );
+  }
+
+  exec.m_scratch_reduce_end = s_tbb_process.m_scratch_reduce_end ;
+  exec.m_scratch_tbb_end = s_tbb_process.m_scratch_tbb_end ;
+
+  if ( s_tbb_process.m_scratch_tbb_end ) {
+
+    // Allocate tracked memory:
+    {
+      Record * const r = Record::allocate( Kokkos::HostSpace() , "thread_scratch" , s_tbb_process.m_scratch_tbb_end );
+
+      Record::increment( r );
+
+      exec.m_scratch = r->data();
+    }
+
+    unsigned * ptr = reinterpret_cast<unsigned *>( exec.m_scratch );
+
+    unsigned * const end = ptr + s_tbb_process.m_scratch_tbb_end / sizeof(unsigned);
+
+    // touch on this thread
+    while ( ptr < end ) *ptr++ = 0 ;
+  }
+}
+
+void * TBBExec::resize_scratch( size_t reduce_size , size_t thread_size )
+{
+  enum { ALIGN_MASK = Kokkos::Impl::MEMORY_ALIGNMENT - 1 };
+
+  fence();
+
+  const size_t old_reduce_size = s_tbb_process.m_scratch_reduce_end ;
+  const size_t old_tbb_size = s_tbb_process.m_scratch_tbb_end - s_tbb_process.m_scratch_reduce_end ;
+
+  reduce_size = ( reduce_size + ALIGN_MASK ) & ~ALIGN_MASK ;
+  thread_size = ( thread_size + ALIGN_MASK ) & ~ALIGN_MASK ;
+
+  // Increase size or deallocate completely.
+
+  if ( ( old_reduce_size < reduce_size ) ||
+       ( old_tbb_size < thread_size ) ||
+       ( ( reduce_size == 0 && thread_size == 0 ) &&
+         ( old_reduce_size != 0 || old_tbb_size != 0 ) ) ) {
+
+    verify_is_process( "TBBExec::resize_scratch" , true );
+
+    s_tbb_process.m_scratch_reduce_end = reduce_size ;
+    s_tbb_process.m_scratch_tbb_end = reduce_size + thread_size ;
+
+    execute_serial( & execute_resize_scratch );
+
+    s_tbb_process.m_scratch = s_tbb_exec[0]->m_scratch ;
+  }
+
+  return s_tbb_process.m_scratch ;
+}
+
+//----------------------------------------------------------------------------
+
+void TBBExec::print_configuration( std::ostream & s , const bool detail )
+{
+  verify_is_process("TBBExec::print_configuration",false);
+
+  fence();
+
+  const unsigned numa_count       = Kokkos::hwloc::get_available_numa_count();
+  const unsigned cores_per_numa   = Kokkos::hwloc::get_available_cores_per_numa();
+  const unsigned threads_per_core = Kokkos::hwloc::get_available_tbb_per_core();
+
+  // Forestall compiler warnings for unused variables.
+  (void) numa_count;
+  (void) cores_per_numa;
+  (void) threads_per_core;
+
+  s << "Kokkos::Threads" ;
+
+#if defined( KOKKOS_ENABLE_THREADS )
+  s << " KOKKOS_ENABLE_THREADS" ;
+#endif
+#if defined( KOKKOS_ENABLE_HWLOC )
+  s << " hwloc[" << numa_count << "x" << cores_per_numa << "x" << threads_per_core << "]" ;
+#endif
+
+  if ( s_tbb_pool_size[0] ) {
+    s << " threads[" << s_tbb_pool_size[0] << "]"
+      << " threads_per_numa[" << s_tbb_pool_size[1] << "]"
+      << " threads_per_core[" << s_tbb_pool_size[2] << "]"
+      ;
+    if ( 0 == s_tbb_process.m_pool_base ) { s << " Asynchronous" ; }
+    s << " ReduceScratch[" << s_current_reduce_size << "]"
+      << " SharedScratch[" << s_current_shared_size << "]" ;
+    s << std::endl ;
+
+    if ( detail ) {
+
+      for ( int i = 0 ; i < s_tbb_pool_size[0] ; ++i ) {
+
+        TBBExec * const th = s_tbb_exec[i] ;
+
+        if ( th ) {
+
+          const int rank_rev = th->m_pool_size - ( th->m_pool_rank + 1 );
+
+          s << " Thread[ " << th->m_pool_rank << " : "
+            << th->m_numa_rank << "." << th->m_numa_core_rank << " ]" ;
+
+          s << " Fan{" ;
+          for ( int j = 0 ; j < th->m_pool_fan_size ; ++j ) {
+            TBBExec * const thfan = th->m_pool_base[rank_rev+(1<<j)] ;
+            s << " [ " << thfan->m_pool_rank << " : "
+              << thfan->m_numa_rank << "." << thfan->m_numa_core_rank << " ]" ;
+          }
+          s << " }" ;
+
+          if ( th == & s_tbb_process ) {
+            s << " is_process" ;
+          }
+        }
+        s << std::endl ;
+      }
+    }
+  }
+  else {
+    s << " not initialized" << std::endl ;
+  }
+}
+
+//----------------------------------------------------------------------------
+
+int TBBExec::is_initialized()
+{ return 0 != s_tbb_exec[0] ; }
+
+void TBBExec::initialize( unsigned thread_count ,
+                              unsigned use_numa_count ,
+                              unsigned use_cores_per_numa ,
+                              bool allow_asynchronous_threadpool )
+{
+  static const Sentinel sentinel ;
+
+  const bool is_initialized = 0 != s_tbb_pool_size[0] ;
+
+  unsigned thread_spawn_failed = 0 ;
+
+  for ( int i = 0; i < TBBExec::MAX_THREAD_COUNT ; i++)
+    s_tbb_exec[i] = NULL;
+
+  if ( ! is_initialized ) {
+
+    // If thread_count, use_numa_count, or use_cores_per_numa are zero
+    // then they will be given default values based upon hwloc detection
+    // and allowed asynchronous execution.
+
+    const bool hwloc_avail = Kokkos::hwloc::available();
+    const bool hwloc_can_bind = hwloc_avail && Kokkos::hwloc::can_bind_threads();
+
+    if ( thread_count == 0 ) {
+      thread_count = hwloc_avail
+      ? Kokkos::hwloc::get_available_numa_count() *
+        Kokkos::hwloc::get_available_cores_per_numa() *
+        Kokkos::hwloc::get_available_tbb_per_core()
+      : 1 ;
+    }
+
+    const unsigned thread_spawn_begin =
+      hwloc::thread_mapping( "Kokkos::TBB::initialize" ,
+                             allow_asynchronous_threadpool ,
+                             thread_count ,
+                             use_numa_count ,
+                             use_cores_per_numa ,
+                             s_tbb_coord );
+
+    const std::pair<unsigned,unsigned> proc_coord = s_tbb_coord[0] ;
+
+    if ( thread_spawn_begin ) {
+      // Synchronous with s_tbb_coord[0] as the process core
+      // Claim entry #0 for binding the process core.
+      s_tbb_coord[0] = std::pair<unsigned,unsigned>(~0u,~0u);
+    }
+
+    s_tbb_pool_size[0] = thread_count ;
+    s_tbb_pool_size[1] = s_tbb_pool_size[0] / use_numa_count ;
+    s_tbb_pool_size[2] = s_tbb_pool_size[1] / use_cores_per_numa ;
+    s_current_function = & execute_function_noop ; // Initialization work function
+
+    for ( unsigned ith = thread_spawn_begin ; ith < thread_count ; ++ith ) {
+
+      s_tbb_process.m_pool_state = TBBExec::Inactive ;
+
+      // If hwloc available then spawned thread will
+      // choose its own entry in 's_tbb_coord'
+      // otherwise specify the entry.
+      s_current_function_arg = (void*)static_cast<uintptr_t>( hwloc_can_bind ? ~0u : ith );
+
+      // Make sure all outstanding memory writes are complete
+      // before spawning the new thread.
+      memory_fence();
+
+      // Spawn thread executing the 'driver()' function.
+      // Wait until spawned thread has attempted to initialize.
+      // If spawning and initialization is successfull then
+      // an entry in 's_tbb_exec' will be assigned.
+      if ( TBBExec::spawn() ) {
+        wait_yield( s_tbb_process.m_pool_state , TBBExec::Inactive );
+      }
+      if ( s_tbb_process.m_pool_state == TBBExec::Terminating ) break ;
+    }
+
+    // Wait for all spawned threads to deactivate before zeroing the function.
+
+    for ( unsigned ith = thread_spawn_begin ; ith < thread_count ; ++ith ) {
+      // Try to protect against cache coherency failure by casting to volatile.
+      TBBExec * const th = ((TBBExec * volatile *)s_tbb_exec)[ith] ;
+      if ( th ) {
+        wait_yield( th->m_pool_state , TBBExec::Active );
+      }
+      else {
+        ++thread_spawn_failed ;
+      }
+    }
+
+    s_current_function     = 0 ;
+    s_current_function_arg = 0 ;
+    s_tbb_process.m_pool_state = TBBExec::Inactive ;
 
     memory_fence();
 
-    #pragma omp parallel num_threads(m_pool_size)
-    {
-      const int rank = omp_get_thread_num();
-
-      if ( 0 != m_pool[rank] ) {
-
-        m_pool[rank]->disband_pool();
-
-        space.deallocate( m_pool[rank] , old_alloc_bytes );
+    if ( ! thread_spawn_failed ) {
+      // Bind process to the core on which it was located before spawning occured
+      if (hwloc_can_bind) {
+        Kokkos::hwloc::bind_this_thread( proc_coord );
       }
 
-      void * const ptr = space.allocate( alloc_bytes );
+      if ( thread_spawn_begin ) { // Include process in pool.
+        const std::pair<unsigned,unsigned> coord = Kokkos::hwloc::get_this_tbb_coordinate();
 
-      m_pool[ rank ] = new( ptr ) HostThreadTeamData();
+        s_tbb_exec[0]                   = & s_tbb_process ;
+        s_tbb_process.m_numa_rank       = coord.first ;
+        s_tbb_process.m_numa_core_rank  = coord.second ;
+        s_tbb_process.m_pool_base       = s_tbb_exec ;
+        s_tbb_process.m_pool_rank       = thread_count - 1 ; // Reversed for scan-compatible reductions
+        s_tbb_process.m_pool_size       = thread_count ;
+        s_tbb_process.m_pool_fan_size   = fan_size( s_tbb_process.m_pool_rank , s_tbb_process.m_pool_size );
+        s_tbb_pid[ s_tbb_process.m_pool_rank ] = pthread_self();
+      }
+      else {
+        s_tbb_process.m_pool_base = 0 ;
+        s_tbb_process.m_pool_rank = 0 ;
+        s_tbb_process.m_pool_size = 0 ;
+        s_tbb_process.m_pool_fan_size = 0 ;
+      }
 
-      m_pool[ rank ]->
-        scratch_assign( ((char *)ptr) + member_bytes
-                      , alloc_bytes
-                      , pool_reduce_bytes
-                      , team_reduce_bytes
-                      , team_shared_bytes
-                      , thread_local_bytes
-                      );
-
-      memory_fence();
-    }
-/* END #pragma omp parallel */
-
-    HostThreadTeamData::organize_pool( m_pool , m_pool_size );
-  }
-}
-
-} // namespace Impl
-} // namespace Kokkos
-
-//----------------------------------------------------------------------------
-//----------------------------------------------------------------------------
-
-namespace Kokkos {
-
-//----------------------------------------------------------------------------
-
-int TBB::get_current_max_threads() noexcept
-{
-  // Using omp_get_max_threads(); is problematic in conjunction with
-  // Hwloc on Intel (essentially an initial call to the TBB runtime
-  // without a parallel region before will set a process mask for a single core
-  // The runtime will than bind threads for a parallel region to other cores on the
-  // entering the first parallel region and make the process mask the aggregate of
-  // the thread masks. The intend seems to be to make serial code run fast, if you
-  // compile with TBB enabled but don't actually use parallel regions or so
-  // static int omp_max_threads = omp_get_max_threads();
-
-  int count = 0;
-  #pragma omp parallel
-  {
-    #pragma omp atomic
-     ++count;
-  }
-  return count;
-}
-
-
-void TBB::initialize( int thread_count )
-{
-  if ( omp_in_parallel() ) {
-    std::string msg("Kokkos::TBB::initialize ERROR : in parallel");
-    Kokkos::Impl::throw_runtime_exception(msg);
-  }
-
-  if ( Impl::t_openmp_instance )
-  {
-    finalize();
-  }
-
-  {
-    if ( Kokkos::show_warnings() && nullptr == std::getenv("OMP_PROC_BIND") ) {
-      printf("Kokkos::TBB::initialize WARNING: OMP_PROC_BIND environment variable not set\n");
-      printf("  In general, for best performance with TBB 4.0 or better set OMP_PROC_BIND=spread and OMP_PLACES=threads\n");
-      printf("  For best performance with TBB 3.1 set OMP_PROC_BIND=true\n");
-      printf("  For unit testing set OMP_PROC_BIND=false\n");
-    }
-
-    TBB::memory_space space ;
-
-    // Before any other call to OMP query the maximum number of threads
-    // and save the value for re-initialization unit testing.
-
-    Impl::g_openmp_hardware_max_threads = get_current_max_threads();
-
-    int process_num_threads = Impl::g_openmp_hardware_max_threads;
-
-    if ( Kokkos::hwloc::available() ) {
-      process_num_threads = Kokkos::hwloc::get_available_numa_count()
-                          * Kokkos::hwloc::get_available_cores_per_numa()
-                          * Kokkos::hwloc::get_available_threads_per_core();
-    }
-
-    // if thread_count  < 0, use g_openmp_hardware_max_threads;
-    // if thread_count == 0, set g_openmp_hardware_max_threads to process_num_threads
-    // if thread_count  > 0, set g_openmp_hardware_max_threads to thread_count
-    if (thread_count < 0 ) {
-      thread_count = Impl::g_openmp_hardware_max_threads;
-    }
-    else if( thread_count == 0 && Impl::g_openmp_hardware_max_threads != process_num_threads ) {
-      Impl::g_openmp_hardware_max_threads = process_num_threads;
-      omp_set_num_threads(Impl::g_openmp_hardware_max_threads);
+      // Initial allocations:
+      TBBExec::resize_scratch( 1024 , 1024 );
     }
     else {
-      if( Kokkos::show_warnings() && thread_count > process_num_threads ) {
-        printf( "Kokkos::TBB::initialize WARNING: You are likely oversubscribing your CPU cores.\n");
-        printf( "  process threads available : %3d,  requested thread : %3d\n", process_num_threads, thread_count );
-      }
-      Impl::g_openmp_hardware_max_threads = thread_count;
-      omp_set_num_threads(Impl::g_openmp_hardware_max_threads);
-    }
-
-    // setup thread local
-    #pragma omp parallel num_threads(Impl::g_openmp_hardware_max_threads)
-    {
-      Impl::t_openmp_instance = nullptr;
-      Impl::t_openmp_hardware_id = omp_get_thread_num();
-      Impl::SharedAllocationRecord< void, void >::tracking_enable();
-    }
-
-    void * const ptr = space.allocate( sizeof(Impl::TBBExec) );
-
-    Impl::t_openmp_instance = new (ptr) Impl::TBBExec( Impl::g_openmp_hardware_max_threads );
-
-    // New, unified host thread team data:
-    {
-      size_t pool_reduce_bytes  =   32 * thread_count ;
-      size_t team_reduce_bytes  =   32 * thread_count ;
-      size_t team_shared_bytes  = 1024 * thread_count ;
-      size_t thread_local_bytes = 1024 ;
-
-      Impl::t_openmp_instance->resize_thread_data( pool_reduce_bytes
-                                                 , team_reduce_bytes
-                                                 , team_shared_bytes
-                                                 , thread_local_bytes
-                                                 );
+      s_tbb_pool_size[0] = 0 ;
+      s_tbb_pool_size[1] = 0 ;
+      s_tbb_pool_size[2] = 0 ;
     }
   }
 
+  if ( is_initialized || thread_spawn_failed ) {
+
+    std::ostringstream msg ;
+
+    msg << "Kokkos::TBB::initialize ERROR" ;
+
+    if ( is_initialized ) {
+      msg << " : already initialized" ;
+    }
+    if ( thread_spawn_failed ) {
+      msg << " : failed to spawn " << thread_spawn_failed << " threads" ;
+    }
+
+    Kokkos::Impl::throw_runtime_exception( msg.str() );
+  }
 
   // Check for over-subscription
   if( Kokkos::show_warnings() && (Impl::mpi_ranks_per_node() * long(thread_count) > Impl::processors_per_node()) ) {
@@ -370,8 +722,11 @@ void TBB::initialize( int thread_count )
     std::cout << "                                    Detected: " << Impl::mpi_ranks_per_node() << " MPI_ranks per node." << std::endl;
     std::cout << "                                    Requested: " << thread_count << " threads per process." << std::endl;
   }
+
   // Init the array for used for arbitrarily sized atomics
   Impl::init_lock_array_host_space();
+
+  Impl::SharedAllocationRecord< void, void >::tracking_enable();
 
   #if defined(KOKKOS_ENABLE_PROFILING)
     Kokkos::Profiling::initialize();
@@ -380,41 +735,51 @@ void TBB::initialize( int thread_count )
 
 //----------------------------------------------------------------------------
 
-void TBB::finalize()
+void TBBExec::finalize()
 {
-  if ( omp_in_parallel() )
-  {
-    std::string msg("Kokkos::TBB::finalize ERROR ");
-    if( !Impl::t_openmp_instance ) msg.append(": not initialized");
-    if( omp_in_parallel() ) msg.append(": in parallel");
-    Kokkos::Impl::throw_runtime_exception(msg);
-  }
+  verify_is_process("TBBExec::finalize",false);
 
-  if ( Impl::t_openmp_instance ) {
+  fence();
 
-    const int nthreads = Impl::t_openmp_instance->m_pool_size <= Impl::g_openmp_hardware_max_threads
-                       ? Impl::g_openmp_hardware_max_threads
-                       : Impl::t_openmp_instance->m_pool_size;
+  resize_scratch(0,0);
 
-    using Exec = Impl::TBBExec;
-    Exec * instance = Impl::t_openmp_instance;
-    instance->~Exec();
+  const unsigned begin = s_tbb_process.m_pool_base ? 1 : 0 ;
 
-    TBB::memory_space space;
-    space.deallocate( instance, sizeof(Exec) );
+  for ( unsigned i = s_tbb_pool_size[0] ; begin < i-- ; ) {
 
-    #pragma omp parallel num_threads(nthreads)
-    {
-      Impl::t_openmp_hardware_id = 0;
-      Impl::t_openmp_instance    = nullptr;
-      Impl::SharedAllocationRecord< void, void >::tracking_disable();
+    if ( s_tbb_exec[i] ) {
+
+      s_tbb_exec[i]->m_pool_state = TBBExec::Terminating ;
+
+      wait_yield( s_tbb_process.m_pool_state , TBBExec::Inactive );
+
+      s_tbb_process.m_pool_state = TBBExec::Inactive ;
     }
 
-    // allow main thread to track
-    Impl::SharedAllocationRecord< void, void >::tracking_enable();
-
-    Impl::g_openmp_hardware_max_threads = 1;
+    s_tbb_pid[i] = 0 ;
   }
+
+  if ( s_tbb_process.m_pool_base ) {
+    ( & s_tbb_process )->~TBBExec();
+    s_tbb_exec[0] = 0 ;
+  }
+
+  if (Kokkos::hwloc::can_bind_threads() ) {
+    Kokkos::hwloc::unbind_this_thread();
+  }
+
+  s_tbb_pool_size[0] = 0 ;
+  s_tbb_pool_size[1] = 0 ;
+  s_tbb_pool_size[2] = 0 ;
+
+  // Reset master thread to run solo.
+  s_tbb_process.m_numa_rank       = 0 ;
+  s_tbb_process.m_numa_core_rank  = 0 ;
+  s_tbb_process.m_pool_base       = 0 ;
+  s_tbb_process.m_pool_rank       = 0 ;
+  s_tbb_process.m_pool_size       = 1 ;
+  s_tbb_process.m_pool_fan_size   = 0 ;
+  s_tbb_process.m_pool_state = TBBExec::Inactive ;
 
   #if defined(KOKKOS_ENABLE_PROFILING)
     Kokkos::Profiling::finalize();
@@ -423,52 +788,45 @@ void TBB::finalize()
 
 //----------------------------------------------------------------------------
 
-void TBB::print_configuration( std::ostream & s , const bool verbose )
-{
-  s << "Kokkos::TBB" ;
+} /* namespace Impl */
+} /* namespace Kokkos */
 
-  const bool is_initialized =  Impl::t_openmp_instance != nullptr;
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
 
-  if ( is_initialized ) {
-    Impl::TBBExec::verify_is_master( "TBB::print_configuration" );
-
-    const int numa_count      = 1;
-    const int core_per_numa   = Impl::g_openmp_hardware_max_threads;
-    const int thread_per_core = 1;
-
-    s << " thread_pool_topology[ " << numa_count
-      << " x " << core_per_numa
-      << " x " << thread_per_core
-      << " ]"
-      << std::endl ;
-  }
-  else {
-    s << " not initialized" << std::endl ;
-  }
-}
-
-std::vector<TBB> TBB::partition(...)
-{ return std::vector<TBB>(1); }
-
-TBB TBB::create_instance(...) { return TBB(); }
-
-
-#if !defined( KOKKOS_DISABLE_DEPRECATED )
+namespace Kokkos {
 
 int TBB::concurrency() {
-  return Impl::g_openmp_hardware_max_threads;
+  return thread_pool_size(0);
 }
 
-void TBB::initialize( int thread_count , int, int )
+Threads & TBB::instance(int)
 {
-  initialize(thread_count);
+  static Threads t ;
+  return t ;
 }
 
+int TBB::thread_pool_size( int depth )
+{
+  return Impl::s_tbb_pool_size[depth];
+}
+
+#if defined( KOKKOS_ACTIVE_EXECUTION_MEMORY_SPACE_HOST )
+int TBB::thread_pool_rank()
+{
+  const pthread_t pid = pthread_self();
+  int i = 0;
+  while ( ( i < Impl::s_tbb_pool_size[0] ) && ( pid != Impl::s_tbb_pid[i] ) ) { ++i ; }
+  return i ;
+}
 #endif
 
-} // namespace Kokkos
+const char* TBB::name() { return "Threads"; }
+} /* namespace Kokkos */
 
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
 #else
-void KOKKOS_CORE_SRC_TBB_EXEC_PREVENT_LINK_ERROR() {}
-#endif //KOKKOS_ENABLE_TBB
+void KOKKOS_CORE_SRC_THREADS_EXEC_PREVENT_LINK_ERROR() {}
+#endif /* #if defined( KOKKOS_ENABLE_THREADS ) */
 

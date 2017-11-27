@@ -41,8 +41,8 @@
 //@HEADER
 */
 
-#ifndef KOKKOS_TBB_WORKGRAPHPOLICY_HPP
-#define KOKKOS_TBB_WORKGRAPHPOLICY_HPP
+#ifndef KOKKOS_THREADS_WORKGRAPHPOLICY_HPP
+#define KOKKOS_THREADS_WORKGRAPHPOLICY_HPP
 
 namespace Kokkos {
 namespace Impl {
@@ -50,12 +50,16 @@ namespace Impl {
 template< class FunctorType , class ... Traits >
 class ParallelFor< FunctorType ,
                    Kokkos::WorkGraphPolicy< Traits ... > ,
-                   Kokkos::TBB
+                   Kokkos::Threads
                  >
 {
 private:
 
   typedef Kokkos::WorkGraphPolicy< Traits ... > Policy ;
+
+  typedef ParallelFor<FunctorType,
+                      Kokkos::WorkGraphPolicy<Traits ...>,
+                      Kokkos::Threads> Self ;
 
   Policy       m_policy ;
   FunctorType  m_functor ;
@@ -68,20 +72,13 @@ private:
   template< class TagType >
   typename std::enable_if< ! std::is_same< TagType , void >::value >::type
   exec_one( const std::int32_t w ) const noexcept
-    { const TagType t{} ; m_functor( t , w ); }
+    { const TagType t{}; m_functor( t , w ); }
 
-public:
-
-  inline
-  void execute()
-  {
-    const int pool_size = TBB::thread_pool_size();
-
-    #pragma omp parallel num_threads(pool_size)
+  inline void exec_one_thread() const noexcept 
     {
       // Spin until COMPLETED_TOKEN.
       // END_TOKEN indicates no work is currently available.
-
+      
       for ( std::int32_t w = Policy::END_TOKEN ;
             Policy::COMPLETED_TOKEN != ( w = m_policy.pop_work() ) ; ) {
         if ( Policy::END_TOKEN != w ) {
@@ -90,6 +87,20 @@ public:
         }
       }
     }
+
+  static inline void thread_main( TBBExec&, const void* arg ) noexcept
+    {
+      const Self& self = *(static_cast<const Self*>(arg));
+      self.exec_one_thread();
+    }
+
+public:
+
+  inline
+  void execute()
+  {
+    TBBExec::start( & Self::thread_main, this );
+    TBBExec::fence();
   }
 
   inline
@@ -97,11 +108,10 @@ public:
              , const Policy      & arg_policy )
     : m_policy( arg_policy )
     , m_functor( arg_functor )
-  {}
+    {}
 };
 
 } // namespace Impl
 } // namespace Kokkos
 
-#endif /* #define KOKKOS_TBB_WORKGRAPHPOLICY_HPP */
-
+#endif /* #define KOKKOS_THREADS_WORKGRAPHPOLICY_HPP */
