@@ -99,20 +99,8 @@ void initialize_internal(const InitArguments& args) {
   // if the exact device is not set, but ndevices was given, assign round-robin
   // using on-node MPI rank
   if (use_gpu < 0 && ndevices >= 0) {
-    auto local_rank_str = std::getenv("OMPI_COMM_WORLD_LOCAL_RANK");  // OpenMPI
-    if (!local_rank_str)
-      local_rank_str = std::getenv("MV2_COMM_WORLD_LOCAL_RANK");  // MVAPICH2
-    if (!local_rank_str)
-      local_rank_str = std::getenv("SLURM_LOCALID");  // SLURM
-    if (local_rank_str) {
-      auto local_rank = std::atoi(local_rank_str);
-      use_gpu         = local_rank % ndevices;
-    } else {
-      // user only gave us ndevices, but the MPI environment variable wasn't
-      // set. start with GPU 0 at this point
-      use_gpu = 0;
-    }
-    // shift assignments over by one so no one is assigned to "skip_device"
+    const int local_rank = Kokkos::Impl::mpi_local_rank_on_node();
+    use_gpu = local_rank % ndevices;
     if (use_gpu >= skip_device) ++use_gpu;
   }
 #endif  // defined( KOKKOS_ENABLE_CUDA )
